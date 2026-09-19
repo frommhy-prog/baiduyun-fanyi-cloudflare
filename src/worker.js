@@ -1,7 +1,7 @@
 const UPSTREAM_TIMEOUT_MS = 9000;
 const MAX_IMAGE_EDGE = 4096;
 /** Cache version — bump when translation policy changes. */
-const CACHE_VER = "baidu:v2-enretry";
+const CACHE_VER = "baidu:v3-foreign";
 
 /** Module-scope Baidu access_token cache (expires_in - 60s). */
 let baiduToken = null;
@@ -19,7 +19,7 @@ function helpHtml() {
 <body style="font-family:system-ui;max-width:40rem;margin:2rem auto;line-height:1.5">
 <h1>百度云翻译 Worker</h1>
 <p>主路径：<b>百度智能云图片翻译</b>（pictrans <code>paste=1</code> → <code>data.pasteImg</code> 整图贴合）。</p>
-<p>默认 <code>from=auto</code>；若 OCR 到英文却未翻译，会<strong>自动再请求一次</strong> <code>from=en</code>。</p>
+<p>默认 <code>from=auto</code>；若检出外文（英/日/韩/俄等）却未翻译，会按语种<strong>自动再请求一次</strong>（如 <code>from=en|jp|kor|ru</code>）。</p>
 <p>只接受 <b>POST</b>。默认返回 <code>application/json</code>（含 Base64 图）。显式 <code>?raw=1</code> 返回图片二进制。</p>
 <p>快捷指令推荐：宽 800 → JPEG → POST <code>?raw=1</code> → 显示结果（不要取字典/Base64）。</p>
 <p>Secrets：<code>BAIDU_API_KEY</code> + <code>BAIDU_SECRET_KEY</code>。</p>
@@ -65,16 +65,38 @@ function wantRaw(request, body) {
   return false;
 }
 
-/** Optional override: ?from=en|auto or body.from */
+/** Baidu pictrans `from` codes we allow as override / retry. */
+const ALLOWED_FROM = new Set([
+  "auto",
+  "en",
+  "jp",
+  "kor",
+  "fra",
+  "spa",
+  "ru",
+  "pt",
+  "de",
+  "it",
+  "dan",
+  "nl",
+  "may",
+  "ara",
+  "hi",
+  "th",
+  "vie",
+  "id",
+]);
+
+/** Optional override: ?from=en|jp|kor|…|auto or body.from */
 function wantFrom(request, body) {
   try {
     const u = new URL(request.url);
     const q = (u.searchParams.get("from") || "").trim().toLowerCase();
-    if (q === "en" || q === "auto") return q;
+    if (ALLOWED_FROM.has(q)) return q;
   } catch (_) {}
   if (body && typeof body.from === "string") {
     const f = body.from.trim().toLowerCase();
-    if (f === "en" || f === "auto") return f;
+    if (ALLOWED_FROM.has(f)) return f;
   }
   return null;
 }
@@ -149,26 +171,65 @@ async function readImageBase64(request) {
   return { imageBase64: stripDataUrl(s), body };
 }
 
-/** Latin letters / common English UI words, not pure CJK. */
-function looksEnglish(text) {
-  const s = String(text || "").trim();
-  if (s.length < 2) return false;
-  if (!/[A-Za-z]{2,}/.test(s)) return false;
-  const letters = (s.match(/[A-Za-z]/g) || []).length;
-  const cjk = (s.match(/[\u4e00-\u9fff]/g) || []).length;
-  return letters >= 2 && letters >= cjk;
+/** Count chars matching a unicode regex. */
+function countRe(s, re) {
+  return (String(s || "").match(re) || []).length;
 }
 
-/** auto 结果里：有英文块且 src===dst → 需要 from=en 再翻一次 */
-function needsEnglishRetry(content) {
-  if (!Array.isArray(content) || content.length === 0) return false;
-  for (const block of content) {
+/**
+ * Non-Chinese foreign text (Latin / JP / KR / Cyrillic / Arabic / Thai / …).
+ * Pure CJK or punctuation-only → false.
+ */
+function looksForeign(text) {
+  const s = String(text || "").trim();
+  if (s.length < 2) return false;
+  const cjk = countRe(s, /[\u4e00-\u9fff]/g);
+  const latin = countRe(s, /[A-Za-z]/g);
+  const kana = countRe(s, /[\u3040-\u30ff]/g);
+  const hangul = countRe(s, /[\uac00-\ud7af]/g);
+  const cyr = countRe(s, /[\u0400-\u04ff]/g);
+  const arab = countRe(s, /[\u0600-\u06ff]/g);
+  const thai = countRe(s, /[\u0e00-\u0e7f]/g);
+  const foreign = latin + kana + hangul + cyr + arab + thai;
+  if (foreign < 2) return false;
+  return foreign >= cjk;
+}
+
+/** Pick Baidu `from` for untranslated foreign blocks (dominant script). */
+function detectRetryFrom(content) {
+  let latin = 0,
+    kana = 0,
+    hangul = 0,
+    cyr = 0,
+    arab = 0,
+    thai = 0;
+  for (const block of content || []) {
     const src = String(block?.src ?? "");
     const dst = String(block?.dst ?? "");
-    if (!looksEnglish(src)) continue;
-    if (src === dst) return true;
+    if (!looksForeign(src) || src !== dst) continue;
+    latin += countRe(src, /[A-Za-z]/g);
+    kana += countRe(src, /[\u3040-\u30ff]/g);
+    hangul += countRe(src, /[\uac00-\ud7af]/g);
+    cyr += countRe(src, /[\u0400-\u04ff]/g);
+    arab += countRe(src, /[\u0600-\u06ff]/g);
+    thai += countRe(src, /[\u0e00-\u0e7f]/g);
   }
-  return false;
+  const scores = [
+    ["kor", hangul],
+    ["jp", kana],
+    ["ru", cyr],
+    ["ara", arab],
+    ["th", thai],
+    ["en", latin],
+  ];
+  scores.sort((a, b) => b[1] - a[1]);
+  if (!scores[0] || scores[0][1] < 2) return null;
+  return scores[0][0];
+}
+
+/** auto 结果里：有外文块且 src===dst → 需要按语种再翻一次 */
+function needsForeignRetry(content) {
+  return detectRetryFrom(content) != null;
 }
 
 export default {
@@ -242,7 +303,7 @@ export default {
         translation: baidu.sumDst || "",
         overlay: "baidu-paste",
         from: baidu.fromUsed,
-        englishRetry: baidu.englishRetry === true,
+        foreignRetry: baidu.foreignRetry === true,
       });
 
       if (env.IMG_TRANSLATE_CACHE) {
@@ -298,27 +359,31 @@ async function getBaiduAccessToken(env) {
 }
 
 /**
- * auto first; if English left untranslated, retry from=en.
+ * auto first; if any foreign text left untranslated, retry with detected from.
  * Explicit fromOverride skips the heuristic.
  */
 async function translateImageSmart(imageBase64, env, fromOverride) {
-  if (fromOverride === "en" || fromOverride === "auto") {
+  if (fromOverride && ALLOWED_FROM.has(fromOverride)) {
     const one = await translateImageViaBaidu(imageBase64, env, fromOverride);
-    return { ...one, fromUsed: fromOverride, englishRetry: false };
+    return { ...one, fromUsed: fromOverride, foreignRetry: false };
   }
 
   const auto = await translateImageViaBaidu(imageBase64, env, "auto");
-  if (!needsEnglishRetry(auto.content)) {
-    return { ...auto, fromUsed: "auto", englishRetry: false };
+  const retryFrom = detectRetryFrom(auto.content);
+  if (!retryFrom) {
+    return { ...auto, fromUsed: "auto", foreignRetry: false };
   }
-  const en = await translateImageViaBaidu(imageBase64, env, "en");
-  return { ...en, fromUsed: "en", englishRetry: true };
+  const second = await translateImageViaBaidu(imageBase64, env, retryFrom);
+  return { ...second, fromUsed: retryFrom, foreignRetry: true };
 }
 
 async function translateImageViaBaidu(imageBase64, env, fromLang) {
   const accessToken = await getBaiduAccessToken(env);
   const jpegBytes = base64ToBytes(imageBase64);
-  const from = fromLang === "en" ? "en" : "auto";
+  const from =
+    fromLang && fromLang !== "auto" && ALLOWED_FROM.has(fromLang)
+      ? fromLang
+      : "auto";
 
   const form = new FormData();
   form.append(
