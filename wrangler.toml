@@ -1,0 +1,14 @@
+name = "baiduyunfanyi"
+main = "src/worker.js"
+compatibility_date = "2024-09-23"
+
+# Free plan: do not set Workers CPU limits (deploy rejects code 100328).
+
+# Required Secrets (set via Dashboard or `wrangler secret put`; NEVER commit values):
+#   BAIDU_API_KEY      (alias: BAIDU_APP_ID)
+#   BAIDU_SECRET_KEY   (alias: BAIDU_SECRET)
+
+# Uncomment after creating a KV namespace and putting its id here:
+# [[kv_namespaces]]
+# binding = "IMG_TRANSLATE_CACHE"
+# id = "YOUR_KV_NAMESPACE_ID"
