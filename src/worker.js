@@ -1,5 +1,7 @@
 const UPSTREAM_TIMEOUT_MS = 9000;
 const MAX_IMAGE_EDGE = 4096;
+/** Cache version — bump when translation policy changes. */
+const CACHE_VER = "baidu:v2-enretry";
 
 /** Module-scope Baidu access_token cache (expires_in - 60s). */
 let baiduToken = null;
@@ -17,19 +19,10 @@ function helpHtml() {
 <body style="font-family:system-ui;max-width:40rem;margin:2rem auto;line-height:1.5">
 <h1>百度云翻译 Worker</h1>
 <p>主路径：<b>百度智能云图片翻译</b>（pictrans <code>paste=1</code> → <code>data.pasteImg</code> 整图贴合）。</p>
-<p>只接受 <b>POST</b>。默认返回 <code>application/json</code>（含 Base64 图），避免 iOS 弹出「完成/取消」文件表。</p>
-<p>iOS 快捷指令推荐步骤：</p>
-<ol>
-<li>截屏 → 调整图像大小（宽 800～1200；长边 ≤4096）→ 转 JPEG</li>
-<li>获取 URL 内容 → POST 到 <code>https://baiduyunfanyi.from-mhy.workers.dev/</code></li>
-<li>请求体：文件 JPEG（<code>Content-Type: image/jpeg</code>）或 JSON <code>{"imageBase64":"..."}</code></li>
-<li>获取字典值 <code>image</code></li>
-<li>用 Base64 解码</li>
-<li>显示结果 / 快速查看（不要用浏览器打开 Worker URL）</li>
-</ol>
-<p>仅当显式加 <code>?raw=1</code> 时返回原始 <code>image/jpeg</code>（或 PNG）二进制，而不是 JSON。</p>
-<p>勿留空的请求头键；勿在解码前快速查看 Base64 文本。</p>
-<p>Secrets：<code>BAIDU_API_KEY</code> + <code>BAIDU_SECRET_KEY</code>（别名 <code>BAIDU_APP_ID</code> / <code>BAIDU_SECRET</code>）。</p>
+<p>默认 <code>from=auto</code>；若 OCR 到英文却未翻译，会<strong>自动再请求一次</strong> <code>from=en</code>。</p>
+<p>只接受 <b>POST</b>。默认返回 <code>application/json</code>（含 Base64 图）。显式 <code>?raw=1</code> 返回图片二进制。</p>
+<p>快捷指令推荐：宽 800 → JPEG → POST <code>?raw=1</code> → 显示结果（不要取字典/Base64）。</p>
+<p>Secrets：<code>BAIDU_API_KEY</code> + <code>BAIDU_SECRET_KEY</code>。</p>
 </body>`;
 }
 
@@ -55,14 +48,12 @@ function stripDataUrl(imageBase64) {
   return s.replace(/\s+/g, "");
 }
 
-/** Detect mime from base64 magic (PNG vs JPEG). */
 function guessImageMime(b64) {
   const s = stripDataUrl(b64);
   if (s.startsWith("iVBOR")) return "image/png";
   return "image/jpeg";
 }
 
-/** Raw binary body only when explicitly requested. */
 function wantRaw(request, body) {
   try {
     const u = new URL(request.url);
@@ -74,11 +65,24 @@ function wantRaw(request, body) {
   return false;
 }
 
+/** Optional override: ?from=en|auto or body.from */
+function wantFrom(request, body) {
+  try {
+    const u = new URL(request.url);
+    const q = (u.searchParams.get("from") || "").trim().toLowerCase();
+    if (q === "en" || q === "auto") return q;
+  } catch (_) {}
+  if (body && typeof body.from === "string") {
+    const f = body.from.trim().toLowerCase();
+    if (f === "en" || f === "auto") return f;
+  }
+  return null;
+}
+
 function isJpegBytes(bytes) {
   return bytes && bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8;
 }
 
-/** Read JPEG base64 from JSON, raw image/*, multipart, or mislabeled binary. */
 async function readImageBase64(request) {
   const ct = (request.headers.get("Content-Type") || "").toLowerCase();
 
@@ -145,6 +149,28 @@ async function readImageBase64(request) {
   return { imageBase64: stripDataUrl(s), body };
 }
 
+/** Latin letters / common English UI words, not pure CJK. */
+function looksEnglish(text) {
+  const s = String(text || "").trim();
+  if (s.length < 2) return false;
+  if (!/[A-Za-z]{2,}/.test(s)) return false;
+  const letters = (s.match(/[A-Za-z]/g) || []).length;
+  const cjk = (s.match(/[\u4e00-\u9fff]/g) || []).length;
+  return letters >= 2 && letters >= cjk;
+}
+
+/** auto 结果里：有英文块且 src===dst → 需要 from=en 再翻一次 */
+function needsEnglishRetry(content) {
+  if (!Array.isArray(content) || content.length === 0) return false;
+  for (const block of content) {
+    const src = String(block?.src ?? "");
+    const dst = String(block?.dst ?? "");
+    if (!looksEnglish(src)) continue;
+    if (src === dst) return true;
+  }
+  return false;
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "GET" || request.method === "HEAD") {
@@ -173,10 +199,13 @@ export default {
       }
 
       const rawOut = wantRaw(request, body);
+      const fromOverride = wantFrom(request, body);
       const cacheKey =
         (await sha256Hex(imageBase64)) +
         (rawOut ? ":raw" : ":json") +
-        ":baidu";
+        ":" +
+        CACHE_VER +
+        (fromOverride ? ":from=" + fromOverride : "");
       const cached = await env.IMG_TRANSLATE_CACHE?.get(cacheKey);
       if (cached) {
         if (rawOut) {
@@ -190,7 +219,7 @@ export default {
         });
       }
 
-      const baidu = await translateImageViaBaidu(imageBase64, env);
+      const baidu = await translateImageSmart(imageBase64, env, fromOverride);
       const pasteImg = stripDataUrl(baidu.pasteImg);
       const imageMime = guessImageMime(pasteImg);
 
@@ -212,6 +241,8 @@ export default {
         imageMime,
         translation: baidu.sumDst || "",
         overlay: "baidu-paste",
+        from: baidu.fromUsed,
+        englishRetry: baidu.englishRetry === true,
       });
 
       if (env.IMG_TRANSLATE_CACHE) {
@@ -266,9 +297,28 @@ async function getBaiduAccessToken(env) {
   return baiduToken;
 }
 
-async function translateImageViaBaidu(imageBase64, env) {
+/**
+ * auto first; if English left untranslated, retry from=en.
+ * Explicit fromOverride skips the heuristic.
+ */
+async function translateImageSmart(imageBase64, env, fromOverride) {
+  if (fromOverride === "en" || fromOverride === "auto") {
+    const one = await translateImageViaBaidu(imageBase64, env, fromOverride);
+    return { ...one, fromUsed: fromOverride, englishRetry: false };
+  }
+
+  const auto = await translateImageViaBaidu(imageBase64, env, "auto");
+  if (!needsEnglishRetry(auto.content)) {
+    return { ...auto, fromUsed: "auto", englishRetry: false };
+  }
+  const en = await translateImageViaBaidu(imageBase64, env, "en");
+  return { ...en, fromUsed: "en", englishRetry: true };
+}
+
+async function translateImageViaBaidu(imageBase64, env, fromLang) {
   const accessToken = await getBaiduAccessToken(env);
   const jpegBytes = base64ToBytes(imageBase64);
+  const from = fromLang === "en" ? "en" : "auto";
 
   const form = new FormData();
   form.append(
@@ -276,7 +326,7 @@ async function translateImageViaBaidu(imageBase64, env) {
     new Blob([jpegBytes], { type: "image/jpeg" }),
     "image.jpg"
   );
-  form.append("from", "auto");
+  form.append("from", from);
   form.append("to", "zh");
   form.append("v", "3");
   form.append("paste", "1");
@@ -316,6 +366,7 @@ async function translateImageViaBaidu(imageBase64, env) {
   return {
     pasteImg: String(pasteImg),
     sumDst: json.data?.sumDst != null ? String(json.data.sumDst) : "",
+    content: Array.isArray(json.data?.content) ? json.data.content : [],
   };
 }
 
